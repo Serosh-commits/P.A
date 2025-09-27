@@ -16,6 +16,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <ncurses.h>
 
 struct ProcessInfo {
     pid_t pid;
@@ -62,6 +63,13 @@ private:
     double system_uptime = 0.0;
     long clk_tck;
     std::ofstream log_file;
+    bool logging_enabled = false;
+    int selected_row = 0;
+    int scroll_offset = 0;
+    bool tree_view = true;
+    std::string sort_criterion = "";
+    std::string filter_str = "";
+    WINDOW *win;
 
     void scanProcesses() {
         processes.clear();
@@ -231,45 +239,6 @@ private:
         prev_work_jiffies = work_jiffies;
     }
 
-    void detectAndHandle() {
-        std::vector<pid_t> zombies;
-        std::vector<pid_t> orphans;
-        for (const auto &proc : processes) {
-            if (proc.state == 'Z') {
-                zombies.push_back(proc.pid);
-            }
-            if (proc.ppid == 1 && proc.pid != 1) {
-                orphans.push_back(proc.pid);
-            }
-        }
-        for (const auto &z_pid : zombies) {
-            auto it = process_map.find(z_pid);
-            if (it != process_map.end()) {
-                std::cout << "Zombie process: PID=" << z_pid << ", Cmd=" << it->second.cmd << std::endl;
-                std::cout << "Kill parent (PPID=" << it->second.ppid << ")? (y/n): ";
-                char confirm;
-                std::cin >> confirm;
-                if (confirm == 'y' || confirm == 'Y') {
-                    kill(it->second.ppid, SIGTERM);
-                    std::cout << "SIGTERM sent to parent.\n";
-                }
-            }
-        }
-        for (const auto &o_pid : orphans) {
-            auto it = process_map.find(o_pid);
-            if (it != process_map.end()) {
-                std::cout << "Orphan process: PID=" << o_pid << ", Cmd=" << it->second.cmd << std::endl;
-                std::cout << "Kill orphan? (y/n): ";
-                char confirm;
-                std::cin >> confirm;
-                if (confirm == 'y' || confirm == 'Y') {
-                    kill(o_pid, SIGTERM);
-                    std::cout << "SIGTERM sent to orphan.\n";
-                }
-            }
-        }
-    }
-
     void logProcesses() {
         if (!log_file.is_open()) {
             log_file.open("process_log.csv", std::ios::app);
@@ -321,36 +290,157 @@ private:
         return filtered;
     }
 
-    void displayTree(pid_t pid, int depth = 0) {
+    void displayHeader() {
+        wattron(win, COLOR_PAIR(1));
+        mvwprintw(win, 0, 0, "System Uptime: %.2f h | MemTotal: %llu MB | Cores: %d | %s", system_uptime / 3600.0, mem_total / 1024, num_cores, logging_enabled ? "Logging: ON" : "Logging: OFF");
+        mvwprintw(win, 1, 0, "F4: Filter | F5: Tree/List | F6: Sort | F9: Kill | L: Log | Q: Quit");
+        wattroff(win, COLOR_PAIR(1));
+    }
+
+    void displayTree(pid_t pid, int depth, int &line, int max_lines, int max_cols) {
+        if (line >= max_lines + scroll_offset || line < scroll_offset) return;
         auto it = process_map.find(pid);
         if (it == process_map.end()) return;
-        for (int i = 0; i < depth; ++i) std::cout << "  ";
-        std::cout << "PID:" << pid
-                  << " PPID:" << it->second.ppid
-                  << " State:" << it->second.state
-                  << " Mem%:" << std::fixed << std::setprecision(2) << it->second.mem_usage
-                  << " CPU%:" << it->second.cpu_usage
-                  << " IO R:" << it->second.io_read_rate << "KB/s"
-                  << " W:" << it->second.io_write_rate << "KB/s"
-                  << " RChar:" << it->second.rchar / 1024 << "KB"
-                  << " WChar:" << it->second.wchar / 1024 << "KB"
-                  << " Shared:" << it->second.shared_clean << "KB"
-                  << " Private:" << it->second.private_dirty << "KB"
-                  << " FD:" << it->second.fd_count
-                  << " Threads:" << it->second.num_threads
-                  << " CtxtSw:" << it->second.voluntary_ctxt_switches
-                  << " Age:" << it->second.process_age << "h"
-                  << " Pri:" << it->second.priority
-                  << " Nice:" << it->second.nice
-                  << " CPUs:" << it->second.cpus_allowed_list
-                  << " Net R:" << it->second.net_rx_rate << "KB/s"
-                  << " W:" << it->second.net_tx_rate << "KB/s"
-                  << " Cmd:" << it->second.cmd << std::endl;
+        if (line >= scroll_offset && line < max_lines + scroll_offset) {
+            std::string indent(depth * 2, ' ');
+            std::string cmd = it->second.cmd;
+            if (cmd.length() > 20) cmd = cmd.substr(0, 17) + "...";
+            int color = (it->second.state == 'Z') ? 3 : (it->second.ppid == 1 && it->second.pid != 1) ? 4 : (it->second.cpu_usage > 50.0) ? 2 : 1;
+            if (line == selected_row) wattron(win, A_REVERSE);
+            wattron(win, COLOR_PAIR(color));
+            mvwprintw(win, line - scroll_offset + 3, 0, "%s%-5d %-5d %c %6.2f %6.2f %6.2f %6.2f %6llu %6llu %6llu %6llu %4llu %4ld %6llu %5.2f %3ld %3ld %-6s %6.2f %6.2f %-20s",
+                      indent.c_str(), it->second.pid, it->second.ppid, it->second.state, it->second.mem_usage, it->second.cpu_usage,
+                      it->second.io_read_rate, it->second.io_write_rate, it->second.rchar / 1024, it->second.wchar / 1024,
+                      it->second.shared_clean, it->second.private_dirty, it->second.fd_count, it->second.num_threads,
+                      it->second.voluntary_ctxt_switches, it->second.process_age, it->second.priority, it->second.nice,
+                      it->second.cpus_allowed_list.c_str(), it->second.net_rx_rate, it->second.net_tx_rate, cmd.c_str());
+            wattroff(win, COLOR_PAIR(color));
+            if (line == selected_row) wattroff(win, A_REVERSE);
+        }
+        line++;
         auto children_it = process_tree.find(pid);
         if (children_it != process_tree.end()) {
             for (const auto &child : children_it->second) {
-                displayTree(child, depth + 1);
+                displayTree(child, depth + 1, line, max_lines, max_cols);
             }
+        }
+    }
+
+    void displayProcesses(int max_lines, int max_cols) {
+        int line = 0;
+        for (const auto &proc : processes) {
+            if (line >= max_lines + scroll_offset || line < scroll_offset) {
+                line++;
+                continue;
+            }
+            std::string cmd = proc.cmd;
+            if (cmd.length() > 20) cmd = cmd.substr(0, 17) + "...";
+            int color = (proc.state == 'Z') ? 3 : (proc.ppid == 1 && proc.pid != 1) ? 4 : (proc.cpu_usage > 50.0) ? 2 : 1;
+            if (line == selected_row) wattron(win, A_REVERSE);
+            wattron(win, COLOR_PAIR(color));
+            mvwprintw(win, line - scroll_offset + 3, 0, "%-5d %-5d %c %6.2f %6.2f %6.2f %6.2f %6llu %6llu %6llu %6llu %4llu %4ld %6llu %5.2f %3ld %3ld %-6s %6.2f %6.2f %-20s",
+                      proc.pid, proc.ppid, proc.state, proc.mem_usage, proc.cpu_usage,
+                      proc.io_read_rate, proc.io_write_rate, proc.rchar / 1024, proc.wchar / 1024,
+                      proc.shared_clean, proc.private_dirty, proc.fd_count, proc.num_threads,
+                      proc.voluntary_ctxt_switches, proc.process_age, proc.priority, proc.nice,
+                      proc.cpus_allowed_list.c_str(), proc.net_rx_rate, proc.net_tx_rate, cmd.c_str());
+            wattroff(win, COLOR_PAIR(color));
+            if (line == selected_row) wattroff(win, A_REVERSE);
+            line++;
+        }
+    }
+
+    void handleInput() {
+        int ch = getch();
+        int max_lines = getmaxy(win) - 3;
+        int total_lines = tree_view ? processes.size() : processes.size();
+        switch (ch) {
+            case KEY_UP:
+                if (selected_row > 0) selected_row--;
+                if (selected_row < scroll_offset) scroll_offset--;
+                break;
+            case KEY_DOWN:
+                if (selected_row < total_lines - 1) selected_row++;
+                if (selected_row >= scroll_offset + max_lines) scroll_offset++;
+                break;
+            case KEY_PPAGE:
+                selected_row -= max_lines;
+                scroll_offset -= max_lines;
+                if (selected_row < 0) selected_row = 0;
+                if (scroll_offset < 0) scroll_offset = 0;
+                break;
+            case KEY_NPAGE:
+                if (selected_row + max_lines < total_lines) selected_row += max_lines;
+                else selected_row = total_lines - 1;
+                if (selected_row >= scroll_offset + max_lines) scroll_offset = selected_row - max_lines + 1;
+                break;
+            case KEY_HOME:
+                selected_row = 0;
+                scroll_offset = 0;
+                break;
+            case KEY_END:
+                selected_row = total_lines - 1;
+                if (selected_row >= max_lines) scroll_offset = selected_row - max_lines + 1;
+                else scroll_offset = 0;
+                break;
+            case KEY_F(4): {
+                char filter_input[256];
+                echo();
+                mvwprintw(win, 0, 0, "Filter cmd: ");
+                wgetnstr(win, filter_input, 255);
+                noecho();
+                filter_str = std::string(filter_input);
+                if (!filter_str.empty()) {
+                    processes = filterProcesses(filter_str);
+                } else {
+                    scanProcesses();
+                }
+                selected_row = 0;
+                scroll_offset = 0;
+                break;
+            }
+            case KEY_F(5):
+                tree_view = !tree_view;
+                selected_row = 0;
+                scroll_offset = 0;
+                break;
+            case KEY_F(6):
+                sort_criterion = (sort_criterion == "cpu") ? "mem" : (sort_criterion == "mem") ? "io" : (sort_criterion == "io") ? "net" : "cpu";
+                sortProcesses(sort_criterion);
+                selected_row = 0;
+                scroll_offset = 0;
+                break;
+            case KEY_F(9): {
+                if (selected_row >= 0 && selected_row < processes.size()) {
+                    auto proc = processes[selected_row];
+                    if (proc.state == 'Z') {
+                        mvwprintw(win, 0, 0, "Kill parent (PPID=%d)? (y/n): ", proc.ppid);
+                        if (getch() == 'y') {
+                            kill(proc.ppid, SIGTERM);
+                            mvwprintw(win, 0, 0, "SIGTERM sent to parent.  ");
+                        }
+                    } else if (proc.ppid == 1 && proc.pid != 1) {
+                        mvwprintw(win, 0, 0, "Kill orphan (PID=%d)? (y/n): ", proc.pid);
+                        if (getch() == 'y') {
+                            kill(proc.pid, SIGTERM);
+                            mvwprintw(win, 0, 0, "SIGTERM sent to orphan.  ");
+                        }
+                    }
+                }
+                break;
+            }
+            case 'l':
+            case 'L':
+                logging_enabled = !logging_enabled;
+                if (!logging_enabled && log_file.is_open()) {
+                    log_file.close();
+                }
+                break;
+            case 'q':
+            case 'Q':
+                endwin();
+                if (log_file.is_open()) log_file.close();
+                exit(0);
         }
     }
 
@@ -362,40 +452,48 @@ public:
             uptime_file >> system_uptime;
             uptime_file.close();
         }
+        initscr();
+        start_color();
+        init_pair(1, COLOR_GREEN, COLOR_BLACK); // Normal
+        init_pair(2, COLOR_RED, COLOR_BLACK);   // High CPU
+        init_pair(3, COLOR_YELLOW, COLOR_BLACK); // Zombie
+        init_pair(4, COLOR_BLUE, COLOR_BLACK);  // Orphan
+        cbreak();
+        noecho();
+        keypad(stdscr, TRUE);
+        win = newwin(0, 0, 0, 0);
+    }
+
+    ~ProcessAnalyzer() {
+        if (log_file.is_open()) log_file.close();
+        endwin();
     }
 
     void run() {
         while (true) {
             scanProcesses();
-            system("clear");
-            std::cout << "Enter sort (c=cpu, m=mem, i=io, n=net) or filter cmd substring (f=string), log (l=y/n): ";
-            std::string input;
-            std::getline(std::cin, input);
-            std::string sort_choice, filter_str, log_choice;
-            if (input == "c" || input == "m" || input == "i" || input == "n") {
-                sort_choice = input;
-            } else if (input.substr(0, 2) == "f=") {
-                filter_str = input.substr(2);
-            } else if (input == "l=y") {
-                log_choice = "y";
-            }
             if (!filter_str.empty()) {
-                auto filtered = filterProcesses(filter_str);
-                processes = filtered;
+                processes = filterProcesses(filter_str);
             }
-            if (!sort_choice.empty()) {
-                sortProcesses(sort_choice);
+            if (!sort_criterion.empty()) {
+                sortProcesses(sort_criterion);
             }
-            std::cout << "Process Tree:\n";
-            if (!sort_choice.empty()) {
-                for (const auto &proc : processes) {
-                    displayTree(proc.pid, 0);
-                }
+            if (logging_enabled) logProcesses();
+            werase(win);
+            displayHeader();
+            mvwprintw(win, 2, 0, "%-5s %-5s %s %6s %6s %6s %6s %6s %6s %6s %6s %4s %4s %6s %5s %3s %3s %-6s %6s %6s %-20s",
+                      "PID", "PPID", "S", "Mem%", "CPU%", "IO R", "IO W", "RChar", "WChar", "Shared", "Priv", "FD", "Thrd", "CtxtSw", "Age", "Pri", "Nice", "CPUs", "Net R", "Net W", "Cmd");
+            int max_lines = getmaxy(win) - 3;
+            int max_cols = getmaxx(win);
+            if (tree_view) {
+                int line = 0;
+                displayTree(1, 0, line, max_lines, max_cols);
             } else {
-                displayTree(1);
+                displayProcesses(max_lines, max_cols);
             }
-            if (log_choice == "y") logProcesses();
-            detectAndHandle();
+            wrefresh(win);
+            timeout(0);
+            handleInput();
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }

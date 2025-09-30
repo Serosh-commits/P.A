@@ -55,11 +55,14 @@ private:
     std::map<pid_t, std::vector<pid_t>> process_tree;
     std::map<pid_t, ProcessInfo> process_map;
     unsigned long long mem_total;
+    unsigned long long mem_free;
+    double system_mem_usage;
+    double system_cpu_usage;
     int num_cores;
     std::vector<ProcessInfo> prev_processes;
     unsigned long long prev_total_jiffies;
     unsigned long long prev_work_jiffies;
-    double poll_interval = 5.0;
+    double poll_interval = 1.0;
     double system_uptime = 0.0;
     long clk_tck;
     std::ofstream log_file;
@@ -69,6 +72,7 @@ private:
     bool tree_view = true;
     std::string sort_criterion = "";
     std::string filter_str = "";
+    std::string status_message = "";
     WINDOW *win;
 
     void scanProcesses() {
@@ -76,7 +80,10 @@ private:
         process_tree.clear();
         process_map.clear();
         DIR *proc_dir = opendir("/proc");
-        if (!proc_dir) return;
+        if (!proc_dir) {
+            status_message = "Error: Cannot open /proc";
+            return;
+        }
         struct dirent *entry;
         while ((entry = readdir(proc_dir))) {
             if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
@@ -187,8 +194,10 @@ private:
             unsigned long long value;
             mem_iss >> key >> value;
             if (key == "MemTotal:") mem_total = value;
+            else if (key == "MemFree:") mem_free = value;
         }
         mem_file.close();
+        system_mem_usage = 100.0 * (1.0 - static_cast<double>(mem_free) / mem_total);
         for (auto &proc : processes) {
             proc.mem_usage = 100.0 * static_cast<double>(proc.rss * getpagesize()) / (mem_total * 1024);
         }
@@ -205,6 +214,11 @@ private:
             work_jiffies = user + nice + system + irq + softirq + steal + guest + guest_nice;
             total_jiffies = work_jiffies + idle + iowait;
             stat_file.close();
+        }
+        if (prev_total_jiffies > 0) {
+            system_cpu_usage = 100.0 * static_cast<double>(work_jiffies - prev_work_jiffies) / (total_jiffies - prev_total_jiffies);
+        } else {
+            system_cpu_usage = 0.0;
         }
         for (auto &proc : processes) {
             auto it = std::find_if(prev_processes.begin(), prev_processes.end(), [&](const ProcessInfo &p) { return p.pid == proc.pid; });
@@ -244,6 +258,8 @@ private:
             log_file.open("process_log.csv", std::ios::app);
             if (log_file) {
                 log_file << "Timestamp,PID,PPID,State,Cmd,Mem%,CPU%,IO R (KB/s),IO W (KB/s),RChar (KB),WChar (KB),Shared (KB),Private (KB),FD,Threads,CtxtSw,Age (h),Priority,Nice,CPUs,Net R (KB/s),Net W (KB/s)\n";
+            } else {
+                status_message = "Error: Cannot open process_log.csv";
             }
         }
         if (log_file) {
@@ -257,7 +273,7 @@ private:
         }
     }
 
-    void sortProcesses(std::string criterion) {
+    void sortProcesses(const std::string &criterion) {
         if (criterion == "cpu") {
             std::sort(processes.begin(), processes.end(), [](const ProcessInfo &a, const ProcessInfo &b) {
                 return a.cpu_usage > b.cpu_usage;
@@ -277,13 +293,14 @@ private:
         }
     }
 
-    std::vector<ProcessInfo> filterProcesses(std::string filter_str) {
-        std::transform(filter_str.begin(), filter_str.end(), filter_str.begin(), ::tolower);
+    std::vector<ProcessInfo> filterProcesses(const std::string &filter_str) {
+        std::string lower_filter = filter_str;
+        std::transform(lower_filter.begin(), lower_filter.end(), lower_filter.begin(), ::tolower);
         std::vector<ProcessInfo> filtered;
         for (const auto &proc : processes) {
             std::string lower_cmd = proc.cmd;
             std::transform(lower_cmd.begin(), lower_cmd.end(), lower_cmd.begin(), ::tolower);
-            if (lower_cmd.find(filter_str) != std::string::npos) {
+            if (lower_cmd.find(lower_filter) != std::string::npos) {
                 filtered.push_back(proc);
             }
         }
@@ -292,8 +309,15 @@ private:
 
     void displayHeader() {
         wattron(win, COLOR_PAIR(1));
-        mvwprintw(win, 0, 0, "System Uptime: %.2f h | MemTotal: %llu MB | Cores: %d | %s", system_uptime / 3600.0, mem_total / 1024, num_cores, logging_enabled ? "Logging: ON" : "Logging: OFF");
+        mvwprintw(win, 0, 0, "System CPU: %.2f%% Mem: %.2f%% Uptime: %.2f h | Cores: %d | %s | Sort: %s",
+                  system_cpu_usage, system_mem_usage, system_uptime / 3600.0, num_cores,
+                  logging_enabled ? "Logging: ON" : "Logging: OFF", sort_criterion.empty() ? "None" : sort_criterion.c_str());
         mvwprintw(win, 1, 0, "F4: Filter | F5: Tree/List | F6: Sort | F9: Kill | L: Log | Q: Quit");
+        if (!status_message.empty()) {
+            wattron(win, COLOR_PAIR(2));
+            mvwprintw(win, 2, 0, "%s", status_message.c_str());
+            wattroff(win, COLOR_PAIR(2));
+        }
         wattroff(win, COLOR_PAIR(1));
     }
 
@@ -350,10 +374,10 @@ private:
         }
     }
 
-    void handleInput() {
-        int ch = getch();
+    void handleInput(int ch) {
         int max_lines = getmaxy(win) - 3;
-        int total_lines = tree_view ? processes.size() : processes.size();
+        int total_lines = processes.empty() ? 0 : processes.size();
+        status_message.clear();
         switch (ch) {
             case KEY_UP:
                 if (selected_row > 0) selected_row--;
@@ -384,16 +408,19 @@ private:
                 else scroll_offset = 0;
                 break;
             case KEY_F(4): {
-                char filter_input[256];
+                char filter_input[256] = {0};
                 echo();
                 mvwprintw(win, 0, 0, "Filter cmd: ");
+                wrefresh(win);
                 wgetnstr(win, filter_input, 255);
                 noecho();
                 filter_str = std::string(filter_input);
                 if (!filter_str.empty()) {
                     processes = filterProcesses(filter_str);
+                    status_message = "Filter applied: " + filter_str;
                 } else {
                     scanProcesses();
+                    status_message = "Filter cleared";
                 }
                 selected_row = 0;
                 scroll_offset = 0;
@@ -403,29 +430,53 @@ private:
                 tree_view = !tree_view;
                 selected_row = 0;
                 scroll_offset = 0;
+                status_message = tree_view ? "Tree view enabled" : "List view enabled";
                 break;
             case KEY_F(6):
                 sort_criterion = (sort_criterion == "cpu") ? "mem" : (sort_criterion == "mem") ? "io" : (sort_criterion == "io") ? "net" : "cpu";
                 sortProcesses(sort_criterion);
                 selected_row = 0;
                 scroll_offset = 0;
+                status_message = "Sort by: " + sort_criterion;
                 break;
             case KEY_F(9): {
                 if (selected_row >= 0 && selected_row < processes.size()) {
                     auto proc = processes[selected_row];
+                    std::string prompt;
+                    bool kill_parent = false;
                     if (proc.state == 'Z') {
-                        mvwprintw(win, 0, 0, "Kill parent (PPID=%d)? (y/n): ", proc.ppid);
-                        if (getch() == 'y') {
-                            kill(proc.ppid, SIGTERM);
-                            mvwprintw(win, 0, 0, "SIGTERM sent to parent.  ");
-                        }
+                        prompt = "Zombie PID=" + std::to_string(proc.pid) + " Cmd=" + proc.cmd + " Kill parent PPID=" + std::to_string(proc.ppid) + "? (y/n): ";
+                        kill_parent = true;
                     } else if (proc.ppid == 1 && proc.pid != 1) {
-                        mvwprintw(win, 0, 0, "Kill orphan (PID=%d)? (y/n): ", proc.pid);
-                        if (getch() == 'y') {
-                            kill(proc.pid, SIGTERM);
-                            mvwprintw(win, 0, 0, "SIGTERM sent to orphan.  ");
-                        }
+                        prompt = "Orphan PID=" + std::to_string(proc.pid) + " Cmd=" + proc.cmd + " Kill? (y/n): ";
+                    } else {
+                        prompt = "Kill PID=" + std::to_string(proc.pid) + " Cmd=" + proc.cmd + "? (y/n): ";
                     }
+                    mvwprintw(win, 0, 0, "%s", prompt.c_str());
+                    wrefresh(win);
+                    char confirm = getch();
+                    if (confirm == 'y' || confirm == 'Y') {
+                        pid_t target_pid = kill_parent ? proc.ppid : proc.pid;
+                        if (kill(target_pid, SIGTERM) == 0) {
+                            status_message = "SIGTERM sent to PID " + std::to_string(target_pid);
+                        } else {
+                            status_message = "Error: Failed to send SIGTERM to PID " + std::to_string(target_pid);
+                        }
+                        scanProcesses(); // Refresh process list
+                        if (!filter_str.empty()) {
+                            processes = filterProcesses(filter_str);
+                        }
+                        if (!sort_criterion.empty()) {
+                            sortProcesses(sort_criterion);
+                        }
+                        selected_row = std::min(selected_row, static_cast<int>(processes.size()) - 1);
+                        if (selected_row < 0) selected_row = 0;
+                        scroll_offset = std::min(scroll_offset, std::max(0, static_cast<int>(processes.size()) - max_lines));
+                    } else {
+                        status_message = "Kill cancelled";
+                    }
+                } else {
+                    status_message = "No process selected";
                 }
                 break;
             }
@@ -435,12 +486,18 @@ private:
                 if (!logging_enabled && log_file.is_open()) {
                     log_file.close();
                 }
+                status_message = logging_enabled ? "Logging enabled" : "Logging disabled";
                 break;
             case 'q':
             case 'Q':
                 endwin();
                 if (log_file.is_open()) log_file.close();
                 exit(0);
+            case KEY_RESIZE:
+                endwin();
+                refresh();
+                werase(win);
+                break;
         }
     }
 
@@ -455,12 +512,14 @@ public:
         initscr();
         start_color();
         init_pair(1, COLOR_GREEN, COLOR_BLACK); // Normal
-        init_pair(2, COLOR_RED, COLOR_BLACK);   // High CPU
+        init_pair(2, COLOR_RED, COLOR_BLACK);   // High CPU, Status
         init_pair(3, COLOR_YELLOW, COLOR_BLACK); // Zombie
         init_pair(4, COLOR_BLUE, COLOR_BLACK);  // Orphan
         cbreak();
         noecho();
         keypad(stdscr, TRUE);
+        curs_set(0);
+        timeout(50); // 50ms for responsive input
         win = newwin(0, 0, 0, 0);
     }
 
@@ -481,20 +540,40 @@ public:
             if (logging_enabled) logProcesses();
             werase(win);
             displayHeader();
-            mvwprintw(win, 2, 0, "%-5s %-5s %s %6s %6s %6s %6s %6s %6s %6s %6s %4s %4s %6s %5s %3s %3s %-6s %6s %6s %-20s",
+            mvwprintw(win, 3, 0, "%-5s %-5s %s %6s %6s %6s %6s %6s %6s %6s %6s %4s %4s %6s %5s %3s %3s %-6s %6s %6s %-20s",
                       "PID", "PPID", "S", "Mem%", "CPU%", "IO R", "IO W", "RChar", "WChar", "Shared", "Priv", "FD", "Thrd", "CtxtSw", "Age", "Pri", "Nice", "CPUs", "Net R", "Net W", "Cmd");
-            int max_lines = getmaxy(win) - 3;
+            int max_lines = getmaxy(win) - 4;
             int max_cols = getmaxx(win);
-            if (tree_view) {
+            if (processes.empty()) {
+                mvwprintw(win, 4, 0, "No processes to display");
+            } else if (tree_view) {
                 int line = 0;
                 displayTree(1, 0, line, max_lines, max_cols);
             } else {
                 displayProcesses(max_lines, max_cols);
             }
             wrefresh(win);
-            timeout(0);
-            handleInput();
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            auto start = std::chrono::steady_clock::now();
+            while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() < poll_interval) {
+                int ch = getch();
+                if (ch != ERR) {
+                    handleInput(ch);
+                    werase(win);
+                    displayHeader();
+                    mvwprintw(win, 3, 0, "%-5s %-5s %s %6s %6s %6s %6s %6s %6s %6s %6s %4s %4s %6s %5s %3s %3s %-6s %6s %6s %-20s",
+                              "PID", "PPID", "S", "Mem%", "CPU%", "IO R", "IO W", "RChar", "WChar", "Shared", "Priv", "FD", "Thrd", "CtxtSw", "Age", "Pri", "Nice", "CPUs", "Net R", "Net W", "Cmd");
+                    if (processes.empty()) {
+                        mvwprintw(win, 4, 0, "No processes to display");
+                    } else if (tree_view) {
+                        int line = 0;
+                        displayTree(1, 0, line, max_lines, max_cols);
+                    } else {
+                        displayProcesses(max_lines, max_cols);
+                    }
+                    wrefresh(win);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
         }
     }
 };

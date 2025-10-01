@@ -74,7 +74,7 @@ Permissions: Run with sudo for full /proc access.
 🛠️ Installation
 
 Clone the repo:
-git clone https://github.com/yourusername/process-analyzer.git
+git clone https://github.com/Serosh-commits/P.A.git
 cd process-analyzer
 
 

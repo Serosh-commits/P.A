@@ -79,7 +79,7 @@ cd process-analyzer
 
 
 Compile:
-g++ -std=c++17 -o analyzer process_analyzer.cpp -lncurses
+g++ -std=c++17 -o analyzer pa.cpp -lncurses
 
 
 

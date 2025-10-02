@@ -9,8 +9,6 @@ A lightweight, htop-like process monitoring tool for Linux, written in C++ with 
 
 🛡️ Zombie/Orphan Handling: Detects and kills zombies (by parent) and orphans via F9.
 
-🎨 Color-Coded UI: Green (normal), red (high CPU >50%), yellow (zombies), blue (orphans).
-
 📝 Logging: Export data to process_log.csv with timestamped metrics.
 
 📋 Interactive Controls:

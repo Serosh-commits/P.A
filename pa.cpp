@@ -57,6 +57,14 @@ private:
         processes.clear();
         process_tree.clear();
         process_map.clear();
+        // Refresh system uptime each scan (seconds since boot)
+        {
+            std::ifstream uptime_file("/proc/uptime");
+            if(uptime_file)
+            {
+                uptime_file >> system_uptime;
+            }
+        }
         DIR *dir=opendir("/proc");
         if(!dir)
         {
@@ -67,12 +75,14 @@ private:
         std::string line;
         while(entry=readdir(dir))
         {
-            if(entry->d_type!=DT_DIR||!isdigit(entry->d_name[0]))
+            // Only consider numeric directory names (PIDs). Do not rely on d_type.
+            std::string dname = entry->d_name;
+            if(!std::all_of(dname.begin(), dname.end(), [](unsigned char c){ return std::isdigit(c); }))
             {
                 continue;
             }
-            pid_t pid=std::stoi(entry->d_name);
-            ProcessInfo info;
+            pid_t pid=static_cast<pid_t>(std::stoi(dname));
+            ProcessInfo info{}; // zero-initialize all fields
             std::string path="/proc/"+std::to_string(pid)+"/stat";
             std::ifstream stat_file(path);
             if(!stat_file)
@@ -80,14 +90,49 @@ private:
                 continue;
             }
             std::getline(stat_file,line);
-            std::istringstream iss(line);
-            int dummy;
-            std::string cmd;
-            uint64_t starttime;
-            iss>>info.pid>>cmd>>info.state>>info.ppid>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>info.utime>>info.stime>>dummy>>dummy>>info.num_threads>>dummy>>dummy>>starttime>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>dummy>>info.priority>>info.nice;
-            cmd=cmd.substr(1,cmd.size()-2);
-            info.cmd=cmd;
-            info.process_age=(system_uptime-static_cast<double>(starttime)/clk_tck)/3600.0;
+            // Robustly parse /proc/[pid]/stat, whose 2nd field (comm) can contain spaces inside parentheses
+            size_t lparen = line.find('(');
+            size_t rparen = line.rfind(')');
+            if(lparen==std::string::npos || rparen==std::string::npos || rparen <= lparen)
+            {
+                // Malformed line, skip
+                continue;
+            }
+            // pid is before the first '('
+            try {
+                info.pid = static_cast<pid_t>(std::stol(line.substr(0, lparen)));
+            } catch(...) {
+                continue;
+            }
+            info.cmd = line.substr(lparen+1, rparen - lparen - 1);
+            // The remainder starts after ") "
+            std::string rest = (rparen + 1 < line.size()) ? line.substr(rparen + 2) : std::string();
+            std::istringstream rss(rest);
+            char state_char;
+            long ppid_l;
+            long pgrp, session, tty_nr, tpgid;
+            unsigned long flags, minflt, cminflt, majflt, cmajflt;
+            unsigned long utime_ul, stime_ul, cutime, cstime;
+            long priority_l, nice_l;
+            long num_threads_l, itrealvalue;
+            unsigned long long starttime_ull;
+            unsigned long vsize;
+            long rss_pages;
+            rss >> state_char >> ppid_l >> pgrp >> session >> tty_nr >> tpgid >> flags >> minflt >> cminflt >> majflt >> cmajflt
+                >> utime_ul >> stime_ul >> cutime >> cstime >> priority_l >> nice_l >> num_threads_l >> itrealvalue >> starttime_ull >> vsize >> rss_pages;
+            if(!rss)
+            {
+                continue;
+            }
+            info.state = state_char;
+            info.ppid = static_cast<pid_t>(ppid_l);
+            info.utime = utime_ul;
+            info.stime = stime_ul;
+            info.num_threads = num_threads_l;
+            info.priority = priority_l;
+            info.nice = nice_l;
+            // starttime is in clock ticks since boot
+            info.process_age = std::max(0.0, (system_uptime - (static_cast<double>(starttime_ull) / static_cast<double>(clk_tck))) / 3600.0);
             stat_file.close();
             path="/proc/"+std::to_string(pid)+"/status";
             std::ifstream status_file(path);
@@ -100,6 +145,7 @@ private:
                     iss>>key;
                     if(key=="VmRSS:")
                     {
+                        // VmRSS is in kB
                         iss>>info.rss;
                     }
                     else if(key=="voluntary_ctxt_switches:")
@@ -179,12 +225,15 @@ private:
             info.fd_count=0;
             if(fd_dir)
             {
-                while(entry=readdir(fd_dir))
+                struct dirent *fd_entry;
+                while((fd_entry=readdir(fd_dir)))
                 {
-                    if(entry->d_type!=DT_DIR)
+                    // Count everything except '.' and '..'
+                    if(std::strcmp(fd_entry->d_name, ".")==0 || std::strcmp(fd_entry->d_name, "..")==0)
                     {
-                        info.fd_count++;
+                        continue;
                     }
+                    ++info.fd_count;
                 }
                 closedir(fd_dir);
             }
@@ -220,30 +269,62 @@ private:
             process_tree[info.ppid].push_back(pid);
         }
         closedir(dir);
-        std::ifstream mem_file("/proc/meminfo");
-        while(std::getline(mem_file,line))
+        // Read memory info (kB). Prefer MemAvailable over MemFree for a realistic view.
+        uint64_t mem_available = 0;
+        mem_total = 0; // reset
         {
-            std::istringstream iss(line);
-            std::string key;
-            uint64_t value;
-            iss>>key>>value;
-            if(key=="MemTotal:")
+            std::ifstream mem_file("/proc/meminfo");
+            while(std::getline(mem_file,line))
             {
-                mem_total=value;
-            }
-            else if(key=="MemFree:")
-            {
-                mem_free=value;
+                std::istringstream iss(line);
+                std::string key;
+                uint64_t value;
+                iss>>key>>value;
+                if(key=="MemTotal:")
+                {
+                    mem_total=value; // kB
+                }
+                else if(key=="MemAvailable:")
+                {
+                    mem_available=value; // kB
+                }
             }
         }
-        mem_file.close();
-        system_mem_usage=100.0*(1.0-static_cast<double>(mem_free)/mem_total);
+        if(mem_total>0)
+        {
+            if(mem_available==0)
+            {
+                // Fallback to MemFree if MemAvailable not found
+                std::ifstream mem_file2("/proc/meminfo");
+                while(std::getline(mem_file2,line))
+                {
+                    std::istringstream iss(line);
+                    std::string key;
+                    uint64_t value;
+                    iss>>key>>value;
+                    if(key=="MemFree:") { mem_available = value; break; }
+                }
+            }
+            system_mem_usage = 100.0 * static_cast<double>(mem_total - mem_available) / static_cast<double>(mem_total);
+        }
+        else
+        {
+            system_mem_usage = 0.0;
+        }
         for(auto &proc:processes)
         {
-            proc.mem_usage=100.0*static_cast<double>(proc.rss*getpagesize())/(mem_total*1024);
+            // proc.rss is in kB; mem_total is in kB
+            if(mem_total>0)
+            {
+                proc.mem_usage = 100.0 * static_cast<double>(proc.rss) / static_cast<double>(mem_total);
+            }
+            else
+            {
+                proc.mem_usage = 0.0;
+            }
         }
         num_cores=sysconf(_SC_NPROCESSORS_ONLN);
-        uint64_t total_jiffies=0,work_jiffies=0;
+        uint64_t total_jiffies=0, work_jiffies=0, idle_jiffies=0;
         std::ifstream stat_file("/proc/stat");
         if(stat_file)
         {
@@ -252,13 +333,18 @@ private:
             std::string cpu;
             uint64_t user,nice,system,idle,iowait,irq,softirq,steal,guest,guest_nice;
             iss>>cpu>>user>>nice>>system>>idle>>iowait>>irq>>softirq>>steal>>guest>>guest_nice;
-            work_jiffies=user+nice+system+irq+softirq+steal+guest+guest_nice;
-            total_jiffies=work_jiffies+idle+iowait;
+            // Compute total and work jiffies (guest times are already accounted for in user/nice on some kernels)
+            uint64_t non_idle = user + nice + system + irq + softirq + steal;
+            idle_jiffies = idle + iowait;
+            work_jiffies = non_idle;
+            total_jiffies = non_idle + idle_jiffies;
             stat_file.close();
         }
         if(prev_total_jiffies>0)
         {
-            system_cpu_usage=100.0*static_cast<double>(work_jiffies-prev_work_jiffies)/(total_jiffies-prev_total_jiffies);
+            uint64_t delta_total = total_jiffies - prev_total_jiffies;
+            uint64_t delta_work = work_jiffies - prev_work_jiffies;
+            system_cpu_usage = (delta_total>0) ? (100.0 * static_cast<double>(delta_work) / static_cast<double>(delta_total)) : 0.0;
         }
         else
         {
@@ -278,7 +364,9 @@ private:
                 uint64_t delta_total=total_jiffies-prev_total_jiffies;
                 if(delta_total>0)
                 {
-                    proc.cpu_usage=100.0*static_cast<double>(delta_process)/delta_total*num_cores;
+                    // delta_process and delta_total are in jiffies aggregated across CPUs
+                    // CPU% scaled to 0..100 (can exceed 100 for multi-threaded tasks)
+                    proc.cpu_usage=100.0*static_cast<double>(delta_process)/static_cast<double>(delta_total);
                 }
                 else
                 {
@@ -581,10 +669,6 @@ private:
 
     void displayTree(pid_t pid,int depth,int &line,int max_lines,int max_cols)
     {
-        if(line>=max_lines+scroll_offset||line<scroll_offset)
-        {
-            return;
-        }
         auto it=process_map.find(pid);
         if(it==process_map.end())
         {
@@ -606,9 +690,15 @@ private:
             wattron(win,COLOR_PAIR(color));
             mvwprintw(win,line-scroll_offset+3,0,"%s%-5d %-5d %c %6.2f %6.2f %6.2f %6.2f %6llu %6llu %6llu %6llu %4llu %4ld %6llu %5.2f %3ld %3ld %-6s %6.2f %6.2f %-20s",
                       indent.c_str(),it->second.pid,it->second.ppid,it->second.state,it->second.mem_usage,it->second.cpu_usage,
-                      it->second.io_read_rate,it->second.io_write_rate,it->second.rchar/1024,it->second.wchar/1024,
-                      it->second.shared_clean,it->second.private_dirty,it->second.fd_count,it->second.num_threads,
-                      it->second.voluntary_ctxt_switches,it->second.process_age,it->second.priority,it->second.nice,
+                      it->second.io_read_rate,it->second.io_write_rate,
+                      static_cast<unsigned long long>(it->second.rchar/1024),
+                      static_cast<unsigned long long>(it->second.wchar/1024),
+                      static_cast<unsigned long long>(it->second.shared_clean),
+                      static_cast<unsigned long long>(it->second.private_dirty),
+                      static_cast<unsigned long long>(it->second.fd_count),
+                      it->second.num_threads,
+                      static_cast<unsigned long long>(it->second.voluntary_ctxt_switches),
+                      it->second.process_age,it->second.priority,it->second.nice,
                       it->second.cpus_allowed_list.c_str(),it->second.net_rx_rate,it->second.net_tx_rate,cmd.c_str());
             wattroff(win,COLOR_PAIR(color));
             if(line==selected_row)
@@ -650,9 +740,15 @@ private:
             wattron(win,COLOR_PAIR(color));
             mvwprintw(win,line-scroll_offset+3,0,"%-5d %-5d %c %6.2f %6.2f %6.2f %6.2f %6llu %6llu %6llu %6llu %4llu %4ld %6llu %5.2f %3ld %3ld %-6s %6.2f %6.2f %-20s",
                       proc.pid,proc.ppid,proc.state,proc.mem_usage,proc.cpu_usage,
-                      proc.io_read_rate,proc.io_write_rate,proc.rchar/1024,proc.wchar/1024,
-                      proc.shared_clean,proc.private_dirty,proc.fd_count,proc.num_threads,
-                      proc.voluntary_ctxt_switches,proc.process_age,proc.priority,proc.nice,
+                      proc.io_read_rate,proc.io_write_rate,
+                      static_cast<unsigned long long>(proc.rchar/1024),
+                      static_cast<unsigned long long>(proc.wchar/1024),
+                      static_cast<unsigned long long>(proc.shared_clean),
+                      static_cast<unsigned long long>(proc.private_dirty),
+                      static_cast<unsigned long long>(proc.fd_count),
+                      proc.num_threads,
+                      static_cast<unsigned long long>(proc.voluntary_ctxt_switches),
+                      proc.process_age,proc.priority,proc.nice,
                       proc.cpus_allowed_list.c_str(),proc.net_rx_rate,proc.net_tx_rate,cmd.c_str());
             wattroff(win,COLOR_PAIR(color));
             if(line==selected_row)
@@ -823,7 +919,7 @@ private:
                     }
                     mvwprintw(win,0,0,"%s",prompt.c_str());
                     wrefresh(win);
-                    char c=getch();
+                    char c=wgetch(win);
                     if(c=='y'||c=='Y')
                     {
                         pid_t pid=kill_parent?proc.ppid:proc.pid;
@@ -936,8 +1032,10 @@ public:
         noecho();
         keypad(stdscr,TRUE);
         curs_set(0);
-        timeout(50);
-        win=newwin(0,0,0,0);
+        // Use stdscr directly for simplicity and portability
+        win = stdscr;
+        // Make getch non-blocking with a short timeout
+        wtimeout(win,50);
     }
 
     ~ProcessAnalyzer()
@@ -996,7 +1094,7 @@ public:
             auto start=std::chrono::steady_clock::now();
             while(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-start).count()<poll_interval)
             {
-                int ch=getch();
+                int ch=wgetch(win);
                 if(ch!=ERR)
                 {
                     handleInput(ch);

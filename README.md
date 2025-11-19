@@ -1,6 +1,6 @@
 # Process Analyzer
 
-A super-lightweight, htop-inspired process viewer for Linux with a clean ncurses interface.  
+A lightweight, htop-inspired process viewer for Linux with a clean ncurses interface which can detect zombie and orphan states and asks the user to kill it or not .  
 Built because I got tired of typing `ps aux | grep` fifty times a day and because `htop` felt too heavy for quick checks on servers with 128+ cores.
 
 It does exactly what I need:

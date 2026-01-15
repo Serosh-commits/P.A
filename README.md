@@ -1,81 +1,62 @@
 # Process Analyzer
 
-A lightweight, htop-inspired process viewer for Linux with a clean ncurses interface which can detect zombie and orphan states and asks the user to kill it or not .  
-Built because I got tired of typing `ps aux | grep` fifty times a day and because `htop` felt too heavy for quick checks on servers with 128+ cores.
+Process Analyzer is a lightweight, efficient process monitor designed for Linux systems. It provides a terminal-based interface using Ncurses to monitor system health and navigate the process tree with minimal overhead.
 
-It does exactly what I need:
+This tool was developed as a high-performance alternative to standard process viewers, focusing on providing deep visibility into process states (including specialized detection for zombies and orphans) while maintaining a low resource footprint.
 
-- Blazing fast (uses < 2 MB RAM, < 0.5 % CPU even on 2000+ processes)  
-- Shows everything useful in one screen: CPU%, Mem%, I/O rates, network rates, FD count, threads, context switches, process age, nice, affinity…  
-- Smart zombie & orphan detection with one-key cleanup (F9)  
-- Powerful filtering that actually works (`cmd:ssh cpu>30 state:R mem>1%`)  
-- Tree view ↔ flat list toggle  
-- CSV logging for later “who ate my disk at 3 a.m.?” investigations  
+## Architecture
 
-Written in modern C++17, single 1200-line source file, no external dependencies except ncurses.
+The project is built with a modular C++11 architecture, separated into distinct engines to ensure the codebase remains maintainable and extensible:
 
-### Screenshot (yes, it looks this good in real life)
+- **SystemUtils**: Responsible for high-frequency scraping of the `/proc` filesystem and calculating deltas for CPU, Memory, IO, and Network usage.
+- **FilterEngine**: A custom query engine that supports complex filters like `cpu>50`, `state:Z`, or `cmd:python`.
+- **DisplayEngine**: Manages the Ncurses rendering pipeline, supporting both hierarchical tree views and flattened lists.
+- **ProcessSorter**: Provides efficient sorting across multiple metrics including disk IO and network throughput.
+- **ProcessLogger**: Handles background logging of process snapshots to CSV for long-term analysis.
 
-```
-System  CPU 8.2%  Mem 38.4% (12.3/32.0 GB)  Uptime 18d 7h  Load 1.24 1.18 1.05  Cores 32  Logging OFF  Sort CPU↓  Filter none
-F4 Filter  F5 Tree/List  F6 Sort  F9 Kill  L Log  Q Quit
+## Core Features
 
- PID   PPID  S  PRI NI  CPU%   MEM%   RSS    VIRT   R/s   W/s   Rnet  Wnet  FD  THR   CSW   AGE       CMD
-12345   1    S   19  0  87.3   12.1  3.9G   8.2G  12M   8M    2.1M  890K  42  12   124k   9d 3h     python3 worker
- 6789 12345  R   19  0  45.1    0.8  256M   1.1G   0     0     0     0    18   1    89k   2h 12m    ├─ worker_thread
-23456  1234  Z   19  0   0.0    0.0    0      0     0     0     0     0     0   0     0    5d 22h    [chrome] <defunct>   ← zombie
-9876    1    S   19  0   0.0    0.1   12M    89M    0     0     0     0     7   3    12    14d 6h    docker-containerd
-```
+- **Low Overhead**: Consistently uses minimal memory and CPU cycles, making it suitable for monitoring heavily loaded production servers.
+- **Comprehensive Metrics**: Displays CPU and memory usage, IO read/write rates, network RX/TX rates, file descriptor counts, thread counts, and context switch frequency.
+- **Zombie & Orphan Management**: Dedicated logic to identify defunct processes and orphans, with integrated tools to send termination signals (SIGTERM) to parents or the processes themselves.
+- **Advanced Filtering**: Live filtering using a simple key-value syntax to isolate specific workloads.
+- **CSV Logging**: Toggleable logging to `process_log.csv` for post-incident investigations.
 
-### Features people actually use
+## Installation and Build
 
-- F4 → type `state:Z` → instantly see all zombies → F9 → kills the parent so the zombie gets reaped  
-- F4 → `ppid:1 cmd:!systemd` → all orphans that aren’t normal services → clean them safely  
-- F6 cycles sort: CPU → Mem → I/O → Network → PID  
-- Press L → everything gets appended to `process_log.csv` with timestamps  
-- Handles terminal resize gracefully, no more garbled UI when you `Ctrl+Z` and `fg`  
-- Works great over SSH with 500+ ms latency
+The project requires `g++` and the `ncurses` development library.
 
-### Building
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/Serosh-commits/P.A.git
+   cd P.A
+   ```
 
+2. Build the project using the provided Makefile:
+   ```bash
+   make
+   ```
+
+3. Run the analyzer:
+   ```bash
+   ./pa
+   ```
+
+To output a single snapshot in JSON format (useful for script integration):
 ```bash
-git clone https://github.com/Serosh-commits/P.A.git
-cd P.A
-g++ -O3 -std=c++17 -o analyzer pa.cpp -lncursesw
-sudo ./analyzer
+./pa --json
 ```
 
-(Use `-lncursesw` for proper Unicode/wide char support. On Debian/Ubuntu just `sudo apt install libncursesw5-dev`.)
+## Interface Controls
 
-### Quick test cases (try them!)
+- **F4**: Apply a filter (e.g., `cmd:nginx`, `cpu>10`).
+- **F5**: Toggle between Tree view and Flat List view.
+- **F6**: Cycle through sorting criteria (CPU, Memory, IO, Network).
+- **F9**: Send a SIGTERM signal to the selected process.
+- **Z**: Filter for zombies and orphaned processes only.
+- **L**: Toggle CSV logging to disk.
+- **Q**: Quit the application.
 
-Create a zombie:
-```bash
-sleep 1000 &
-kill -STOP $!
-```
-→ filter `state:Z` → select it → F9 (it will kill the stopped parent and reap the zombie)
+## Design Philosophy
 
-Create an orphan:
-```bash
-bash -c 'sleep 1000 &' 
-kill $!   # kills the bash, leaving sleep with ppid 1
-```
-→ filter `ppid:1` → kill it safely
-
-### Why I made yet another process viewer
-
-- `top`/`htop` are great but feel sluggish on machines with 4000+ threads  
-- I wanted per-process network counters without installing bcc tools everywhere  
-- I kept forgetting the magic `ps` incantations  
-- Killing zombies manually is annoying (`kill -9 <parent>` → wait → check again…)  
-
-So I spent a weekend and wrote this. Now I use it on every server I touch.
-
-### Contributing
-
-Found a bug? Want colors? Want per-CPU breakdown? Open an issue or PR – I’ll merge anything that keeps the binary under 200 KB and doesn’t add dependencies.
-
-If it saves you five minutes today, consider giving it a star. That’s all I ask.
-
-Happy sysadmining!
+The primary objective of Process Analyzer is to provide immediate, actionable intelligence about system processes without the complexity or weight of larger monitoring suites. By interacting directly with kernel-exposed data in `/proc`, it offers a transparent view of system behavior.

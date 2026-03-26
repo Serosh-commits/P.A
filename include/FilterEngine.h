@@ -11,4 +11,4 @@ namespace FilterEngine {
     std::vector<ProcessInfo> filterProcesses(const std::vector<ProcessInfo>& processes, const std::vector<Filter>& filters, std::string& status_msg);
 }
 
-#endif // FILTER_ENGINE_H
+#endif

@@ -1,138 +1,174 @@
 #include "DisplayEngine.h"
 #include <cmath>
 #include <algorithm>
+#include <cstring>
+#include <cstdio>
 
 namespace DisplayEngine {
 
-void displayHeader(WINDOW* win, uint64_t mem_total, uint64_t mem_free, 
-                    double system_cpu_usage, double system_mem_usage, 
-                    double system_uptime, int num_cores, 
-                    const std::vector<Filter>& filters, bool logging_enabled, 
-                    const std::string& sort_criterion, const std::string& status_msg)
-{
-    double load[3];
-    getloadavg(load, 3);
+static char buf[2048];
 
-    wattron(win, COLOR_PAIR(1));
-    std::string filter_display = filters.empty() ? "None" : "";
-    for (int i = 0; i < (int)filters.size(); i++)
-    {
-        if (i > 0)
-        {
-            filter_display += " ";
-        }
-        filter_display += filters[i].key + filters[i].op + filters[i].value;
-    }
+static inline double sane(double v) { return (v < 0 || std::isnan(v)) ? 0.0 : v; }
 
-    double used_mem = (double)(mem_total - mem_free) / 1024.0 / 1024.0;
-    double total_mem = (double)mem_total / 1024.0 / 1024.0;
-
-    mvwprintw(win, 0, 0, "CPU: %.1f%% | Mem: %.1f%% (%.1f/%.1f GB) | Load: %.2f %.2f %.2f | Uptime: %.2f h | Cores: %d",
-              system_cpu_usage, system_mem_usage, used_mem, total_mem, load[0], load[1], load[2], system_uptime / 3600.0, num_cores);
-
-    mvwprintw(win, 1, 0, "Log: %s | Sort: %s | Filter: %s",
-              logging_enabled ? "ON" : "OFF", sort_criterion.empty() ? "None" : sort_criterion.c_str(), filter_display.c_str());
-
-    mvwprintw(win, 2, 0, "F4: Filter | F5: Tree/List | F6: Sort | F9: Kill | Z: Zombies | L: Log | Q: Quit");
-    if (!status_msg.empty())
-    {
-        wattron(win, COLOR_PAIR(2));
-        mvwprintw(win, 2, 0, "%s", status_msg.c_str());
-        wattroff(win, COLOR_PAIR(2));
-    }
-    wattroff(win, COLOR_PAIR(1));
+static std::string fitstr(const std::string& s, int w) {
+    if (w <= 0) return "";
+    if ((int)s.size() >= w) return s.substr(0, w);
+    return s + std::string(w - s.size(), ' ');
 }
 
-void displayTree(WINDOW* win, pid_t pid, int depth, int &line, int max_lines, 
-                    int scroll_offset, int selected_row, 
-                    const std::map<pid_t, ProcessInfo>& process_map, 
-                    const std::map<pid_t, std::vector<pid_t>>& process_tree)
-{    
-    auto it = process_map.find(pid);
-    if (it == process_map.end())
-    {
-        return;
-    }
-    
-    if (line >= scroll_offset && line < max_lines + scroll_offset)
-    {
-        std::string indent(depth * 2, ' ');
-        std::string cmd = it->second.cmd;
-        if (cmd.length() > 20)
-        {
-            cmd = cmd.substr(0, 17) + "...";
-        }
-        if (line == selected_row)
-        {
-            wattron(win, A_REVERSE);
-        }
-        double io_read = (it->second.io_read_rate < 0 || std::isnan(it->second.io_read_rate)) ? 0.0 : it->second.io_read_rate;
-        double io_write = (it->second.io_write_rate < 0 || std::isnan(it->second.io_write_rate)) ? 0.0 : it->second.io_write_rate;
-        double net_rx = (it->second.net_rx_rate < 0 || std::isnan(it->second.net_rx_rate)) ? 0.0 : it->second.net_rx_rate;
-        double net_tx = (it->second.net_tx_rate < 0 || std::isnan(it->second.net_tx_rate)) ? 0.0 : it->second.net_tx_rate;
+void displayHeader(WINDOW* win, uint64_t, uint64_t,
+                    double system_cpu_usage, double,
+                    double system_uptime, int num_cores,
+                    const std::vector<Filter>& /*filters*/, bool logging_enabled,
+                    const std::string& sort_criterion, const std::string& status_msg,
+                    const SystemUtils::CPULoadBreakdown& b,
+                    const SystemUtils::MemBreakdown& m)
+{
+    int width = getmaxx(win);
+    double load[3] = {0,0,0};
+    getloadavg(load, 3);
 
-        mvwprintw(win, line - scroll_offset + 4, 0, "%s%-5d %-5d %c %6.1f %6.1f %6.1f %6.1f %6llu %6llu %6llu %6llu %4llu %4ld %6llu %5.1f %3ld %3ld %-6s %6.1f %6.1f %-20s",
-                  indent.c_str(), it->second.pid, it->second.ppid, it->second.state, it->second.mem_usage, it->second.cpu_usage,
-                  io_read, io_write, (unsigned long long)(it->second.rchar / 1024), (unsigned long long)(it->second.wchar / 1024),
-                  (unsigned long long)it->second.shared_clean, (unsigned long long)it->second.private_dirty, (unsigned long long)it->second.fd_count, it->second.num_threads,
-                  (unsigned long long)it->second.voluntary_ctxt_switches, it->second.process_age, it->second.priority, it->second.nice,
-                  it->second.cpus_allowed_list.c_str(), net_rx, net_tx, cmd.c_str());
-        if (line == selected_row)
-        {
-            wattroff(win, A_REVERSE);
-        }
+    int bar_w = (width - 25) / 2;
+    if (bar_w < 5)   bar_w = 5;
+    if (bar_w > 100) bar_w = 100;
+
+    // Only God and I knew what this did. Now only God knows.
+    mvwaddstr(win, 0, 0, "CPU[");
+    int x_fill = 0;
+    auto draw_cpu = [&](double pct, int cp_idx) {
+        int count = (int)(pct * bar_w / 100.0);
+        wattrset(win, COLOR_PAIR(cp_idx) | A_BOLD);
+        for(int i=0; i<count && x_fill<bar_w; i++, x_fill++) waddch(win, '|');
+    };
+    draw_cpu(b.user, 1);
+    draw_cpu(b.nice, 7);
+    draw_cpu(b.sys,  2);
+    draw_cpu(b.irq + b.softirq, 3);
+    wattrset(win, COLOR_PAIR(6));
+    while(x_fill < bar_w) { waddch(win, ' '); x_fill++; }
+    wprintw(win, "%5.1f%%]", system_cpu_usage);
+    
+    if (width > 65)
+        mvwprintw(win, 0, width - 28, "Load: %.2f %.2f %.2f", load[0], load[1], load[2]);
+
+    mvwaddstr(win, 1, 0, "Mem[");
+    int m_fill = 0;
+    auto draw_mem = [&](uint64_t kb, int cp_idx) {
+        int count = (int)((double)kb * bar_w / (double)m.total);
+        wattrset(win, COLOR_PAIR(cp_idx) | A_BOLD);
+        for(int i=0; i<count && m_fill<bar_w; i++, m_fill++) waddch(win, '|');
+    };
+    draw_mem(m.shorthand_used, 1);
+    draw_mem(m.buffers, 7);
+    draw_mem(m.cached + m.s_reclaimable, 3);
+    wattrset(win, COLOR_PAIR(6));
+    while(m_fill < bar_w) { waddch(win, ' '); m_fill++; }
+    
+    double used_gb = (double)(m.total - m.free) / 1024.0 / 1024.0;
+    double total_gb = (double)m.total / 1024.0 / 1024.0;
+    wprintw(win, "%.1f/%.1fG]", used_gb, total_gb);
+
+    if (width > 65) {
+        int ud = (int)(system_uptime/86400), uh = ((int)system_uptime%86400)/3600, um = ((int)system_uptime%3600)/60;
+        mvwprintw(win, 1, width - 28, "Up: %dd%02dh%02dm  Cores: %d", ud, uh, um, num_cores);
+    }
+
+    wattrset(win, COLOR_PAIR(6));
+    std::snprintf(buf, sizeof(buf), " Sort: %s | Log: %s",
+                  sort_criterion.empty() ? "PID" : sort_criterion.c_str(),
+                  logging_enabled ? "ON" : "OFF");
+    mvwaddnstr(win, 2, 0, buf, width);
+    if (!status_msg.empty()) {
+        wattrset(win, COLOR_PAIR(3) | A_BOLD);
+        mvwaddnstr(win, 3, 0, status_msg.c_str(), width);
+    }
+    wattrset(win, A_NORMAL);
+}
+
+static void formatProcessLine(const ProcessInfo& p, const std::string& display_cmd, int cmd_w)
+{
+    std::string cmd_fixed = fitstr(display_cmd, cmd_w);
+    std::snprintf(buf, sizeof(buf),
+        "%5d %5d %c %5.1f %5.1f %s %6.1f %6.1f %6d %6d %6llu %6llu %5llu %4ld %6llu %5.1f %3ld %3ld %6.1f %6.1f",
+        (int)p.pid, (int)p.ppid, p.state,
+        sane(p.cpu_usage), sane(p.mem_usage),
+        cmd_fixed.c_str(),
+        sane(p.io_read_rate), sane(p.io_write_rate),
+        (int)(p.rchar/1024), (int)(p.wchar/1024),
+        (unsigned long long)p.shared_clean, (unsigned long long)p.private_dirty,
+        (unsigned long long)p.fd_count, p.num_threads,
+        (unsigned long long)p.voluntary_ctxt_switches,
+        sane(p.process_age), p.priority, p.nice,
+        sane(p.net_rx_rate), sane(p.net_tx_rate));
+}
+
+static int getAttrForState(const ProcessInfo& p, int selected_row, int line) {
+    if (line == selected_row) return A_REVERSE;
+    char st = p.state;
+    if (st == 'R') return COLOR_PAIR(1) | A_BOLD;
+    if (st == 'Z') return COLOR_PAIR(2) | A_BOLD;
+    if (st == 'D') return COLOR_PAIR(2);
+    if (st == 'T') return COLOR_PAIR(5);
+    if (st == 'I') return COLOR_PAIR(6) | A_DIM;
+    if (p.cpu_usage > 50.0) return COLOR_PAIR(3);
+    if (p.ppid == 1 && p.pid != 1) return COLOR_PAIR(4);
+    return COLOR_PAIR(6);
+}
+
+static void renderLine(WINDOW* win, int screen_y, int h_scroll_offset, int width, int attr) {
+    wattrset(win, attr);
+    int len = (int)std::strlen(buf);
+    if (h_scroll_offset < len)
+        mvwaddnstr(win, screen_y, 0, buf + h_scroll_offset, width);
+    else
+        mvwhline(win, screen_y, 0, ' ', width);
+    wattrset(win, A_NORMAL);
+}
+
+void displayTree(WINDOW* win, pid_t pid, int depth, int &line, int max_lines,
+                    int scroll_offset, int h_scroll_offset, int selected_row,
+                    const std::map<pid_t, ProcessInfo>& process_map,
+                    const std::map<pid_t, std::vector<pid_t>>& process_tree)
+{
+    auto it = process_map.find(pid);
+    if (it == process_map.end()) return;
+
+    if (line >= scroll_offset && line < max_lines + scroll_offset) {
+        int width = getmaxx(win);
+        int cmd_w = std::min(40, std::max(15, width - 35));
+
+        std::string indent;
+        for (int d = 0; d < depth; d++)
+            indent += (d == depth - 1) ? " |- " : "    ";
+        std::string display_cmd = indent + it->second.cmd;
+
+        formatProcessLine(it->second, display_cmd, cmd_w);
+        int attr = getAttrForState(it->second, selected_row, line);
+        renderLine(win, line - scroll_offset + 5, h_scroll_offset, width, attr);
     }
     line++;
     auto children = process_tree.find(pid);
     if (children != process_tree.end())
-    {
         for (const auto &child : children->second)
-        {
-            displayTree(win, child, depth + 1, line, max_lines, scroll_offset, selected_row, process_map, process_tree);
-        }
-    }
+            displayTree(win, child, depth + 1, line, max_lines, scroll_offset, h_scroll_offset, selected_row, process_map, process_tree);
 }
 
-void displayProcesses(WINDOW* win, int max_lines, int scroll_offset, 
+void displayProcesses(WINDOW* win, int max_lines, int scroll_offset, int h_scroll_offset,
                         int selected_row, const std::vector<ProcessInfo>& processes)
 {
+    int width = getmaxx(win);
+    int cmd_w = std::min(40, std::max(15, width - 35));
     int line = 0;
-    for (const auto &proc : processes)
-    {
-        if (line >= max_lines + scroll_offset || line < scroll_offset)
-        {
-            line++;
-            continue;
-        }
-        std::string cmd = proc.cmd;
-        if (cmd.length() > 20)
-        {
-            cmd = cmd.substr(0, 17) + "...";
-        }
-        double io_read = (proc.io_read_rate < 0 || std::isnan(proc.io_read_rate)) ? 0.0 : proc.io_read_rate;
-        double io_write = (proc.io_write_rate < 0 || std::isnan(proc.io_write_rate)) ? 0.0 : proc.io_write_rate;
-        double net_rx = (proc.net_rx_rate < 0 || std::isnan(proc.net_rx_rate)) ? 0.0 : proc.net_rx_rate;
-        double net_tx = (proc.net_tx_rate < 0 || std::isnan(proc.net_tx_rate)) ? 0.0 : proc.net_tx_rate;
 
-        int color = (proc.state == 'Z') ? 3 : (proc.ppid == 1 && proc.pid != 1) ? 4 : (proc.cpu_usage > 50.0) ? 2 : 1;
-        if (line == selected_row)
-        {
-            wattron(win, A_REVERSE);
-        }
-        wattron(win, COLOR_PAIR(color));
-        mvwprintw(win, line - scroll_offset + 4, 0, "%-5d %-5d %c %6.1f %6.1f %6.1f %6.1f %6llu %6llu %6llu %6llu %4llu %4ld %6llu %5.1f %3ld %3ld %-6s %6.1f %6.1f %-20s",
-                  proc.pid, proc.ppid, proc.state, proc.mem_usage, proc.cpu_usage,
-                  io_read, io_write, (unsigned long long)(proc.rchar / 1024), (unsigned long long)(proc.wchar / 1024),
-                  (unsigned long long)proc.shared_clean, (unsigned long long)proc.private_dirty, (unsigned long long)proc.fd_count, proc.num_threads,
-                  (unsigned long long)proc.voluntary_ctxt_switches, proc.process_age, proc.priority, proc.nice,
-                  proc.cpus_allowed_list.c_str(), net_rx, net_tx, cmd.c_str());
-        wattroff(win, COLOR_PAIR(color));
-        if (line == selected_row)
-        {
-            wattroff(win, A_REVERSE);
-        }
+    for (const auto &proc : processes) {
+        if (line >= max_lines + scroll_offset) break;
+        if (line < scroll_offset) { line++; continue; }
+
+        formatProcessLine(proc, proc.cmd, cmd_w);
+        int attr = getAttrForState(proc, selected_row, line);
+        renderLine(win, line - scroll_offset + 5, h_scroll_offset, width, attr);
         line++;
     }
 }
 
-} // namespace DisplayEngine
+}

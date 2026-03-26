@@ -27,6 +27,8 @@ struct SystemStats
 struct Filter
 {
     std::string key, op, value;
+    double numeric_val;
+    long long_val;
 };
 
-#endif // PROCESS_INFO_H
+#endif

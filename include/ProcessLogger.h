@@ -10,4 +10,4 @@ namespace ProcessLogger {
     void logProcesses(std::ofstream& log_file, const std::vector<ProcessInfo>& processes, std::string& status_msg);
 }
 
-#endif // PROCESS_LOGGER_H
+#endif

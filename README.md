@@ -1,62 +1,40 @@
-# Process Analyzer
+# P.A (Process Analyzer)
 
-Process Analyzer is a lightweight, efficient process monitor designed for Linux systems. It provides a terminal-based interface using Ncurses to monitor system health and navigate the process tree with minimal overhead.
+P.A is a fast, lightweight system monitor for Linux written in C++11 and ncurses. I built it as an alternative to htop, focusing on direct `/proc` parsing and better handling of process states, zombies, and kernel threads.
 
-This tool was developed as a high-performance alternative to standard process viewers, focusing on providing deep visibility into process states (including specialized detection for zombies and orphans) while maintaining a low resource footprint.
+## Features
 
-## Architecture
+- **Htop-style UI**: Multi-colored bars for CPU (User/Sys/Nice/IRQ) and Memory (Used/Buffers/Cache).
+- **Accurate network & IO tracking**: Properly ignores `PF_KTHREAD` (kernel threads) so they don't bleed into network and IO stats.
+- **Filtering & Search**: Incremental search (`/`) and live advanced filtering (`\`) to easily isolate specific workloads. 
+- **Tree & List views**: Toggle between hierarchical process trees and flat lists.
+- **Process management**: Built-in support for sending signals and purging zombies directly from the UI.
+- **JSON mode**: Run `./pa --json` to get a two-scan live snapshot of the system for scripting.
 
-The project is built with a modular C++11 architecture, separated into distinct engines to ensure the codebase remains maintainable and extensible:
+## Building
 
-- **SystemUtils**: Responsible for high-frequency scraping of the `/proc` filesystem and calculating deltas for CPU, Memory, IO, and Network usage.
-- **FilterEngine**: A custom query engine that supports complex filters like `cpu>50`, `state:Z`, or `cmd:python`.
-- **DisplayEngine**: Manages the Ncurses rendering pipeline, supporting both hierarchical tree views and flattened lists.
-- **ProcessSorter**: Provides efficient sorting across multiple metrics including disk IO and network throughput.
-- **ProcessLogger**: Handles background logging of process snapshots to CSV for long-term analysis.
+You just need `g++` and the ncurses development headers (`libncurses5-dev` or `ncurses-devel`).
 
-## Core Features
-
-- **Low Overhead**: Consistently uses minimal memory and CPU cycles, making it suitable for monitoring heavily loaded production servers.
-- **Comprehensive Metrics**: Displays CPU and memory usage, IO read/write rates, network RX/TX rates, file descriptor counts, thread counts, and context switch frequency.
-- **Zombie & Orphan Management**: Dedicated logic to identify defunct processes and orphans, with integrated tools to send termination signals (SIGTERM) to parents or the processes themselves.
-- **Advanced Filtering**: Live filtering using a simple key-value syntax to isolate specific workloads.
-- **CSV Logging**: Toggleable logging to `process_log.csv` for post-incident investigations.
-
-## Installation and Build
-
-The project requires `g++` and the `ncurses` development library.
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Serosh-commits/P.A.git
-   cd P.A
-   ```
-
-2. Build the project using the provided Makefile:
-   ```bash
-   make
-   ```
-
-3. Run the analyzer:
-   ```bash
-   ./pa
-   ```
-
-To output a single snapshot in JSON format (useful for script integration):
 ```bash
-./pa --json
+git clone https://github.com/Serosh-commits/P.A.git
+cd P.A
+make
+./pa
 ```
 
-## Interface Controls
+## Keybindings
 
-- **F4**: Apply a filter (e.g., `cmd:nginx`, `cpu>10`).
-- **F5**: Toggle between Tree view and Flat List view.
-- **F6**: Cycle through sorting criteria (CPU, Memory, IO, Network).
-- **F9**: Send a SIGTERM signal to the selected process.
-- **Z**: Filter for zombies and orphaned processes only.
-- **L**: Toggle CSV logging to disk.
-- **Q**: Quit the application.
-
-## Design Philosophy
-
-The primary objective of Process Analyzer is to provide immediate, actionable intelligence about system processes without the complexity or weight of larger monitoring suites. By interacting directly with kernel-exposed data in `/proc`, it offers a transparent view of system behavior.
+- `F1` or `h` or `?`: Show help
+- `F3` or `/`: Search for a process by name
+- `F4` or `\`: Filter processes (e.g., `cpu>50`, `cmd:python`)
+- `F5` or `t`: Toggle between tree and list view
+- `F6` or `>` or `.`: Cycle sort column (CPU, Mem, IO, Net)
+- `F9` or `k`: Kill selected process
+- `F10` or `q`: Quit
+- `P`: Sort by CPU
+- `M`: Sort by Memory
+- `N`: Sort by PID
+- `I`: Invert sort order
+- `z`: Show only zombies/orphans
+- `x`: Purge zombies (sends standard signals to their parents)
+- `l`: Toggle CSV logging

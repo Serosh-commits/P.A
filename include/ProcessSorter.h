@@ -9,4 +9,4 @@ namespace ProcessSorter {
     void sortProcesses(std::vector<ProcessInfo>& processes, const std::string& criterion);
 }
 
-#endif // PROCESS_SORTER_H
+#endif

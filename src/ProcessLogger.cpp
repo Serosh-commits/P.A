@@ -29,4 +29,4 @@ void logProcesses(std::ofstream& log_file, const std::vector<ProcessInfo>& proce
     }
 }
 
-} // namespace ProcessLogger
+}
